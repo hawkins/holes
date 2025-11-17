@@ -6,7 +6,7 @@ import (
 	"strconv"
 
 	"github.com/charmbracelet/huh"
-	"holes/tunnel"
+	"github.com/hawkins/holes/tunnel"
 )
 
 func main() {
