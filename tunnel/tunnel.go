@@ -7,7 +7,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Tunnel represents an SSH tunnel configuration
@@ -23,9 +25,10 @@ type Tunnel struct {
 
 // Manager handles tunnel operations
 type Manager struct {
-	configPath string
-	tunnels    map[string]*Tunnel
-	mu         sync.RWMutex
+	configPath     string
+	lastTunnelPath string
+	tunnels        map[string]*Tunnel
+	mu             sync.RWMutex
 }
 
 // NewManager creates a new tunnel manager
@@ -41,10 +44,12 @@ func NewManager() (*Manager, error) {
 	}
 
 	configPath := filepath.Join(configDir, "tunnels.json")
+	lastTunnelPath := filepath.Join(configDir, "last_tunnel.json")
 
 	m := &Manager{
-		configPath: configPath,
-		tunnels:    make(map[string]*Tunnel),
+		configPath:     configPath,
+		lastTunnelPath: lastTunnelPath,
+		tunnels:        make(map[string]*Tunnel),
 	}
 
 	// Load existing tunnels
@@ -76,6 +81,44 @@ func (m *Manager) save() error {
 	}
 
 	return os.WriteFile(m.configPath, data, 0644)
+}
+
+// saveLastTunnel saves the last created tunnel configuration
+func (m *Manager) saveLastTunnel(t *Tunnel) error {
+	// Create a copy without the PID for use as a template
+	template := &Tunnel{
+		Name:       t.Name,
+		LocalPort:  t.LocalPort,
+		RemoteHost: t.RemoteHost,
+		RemotePort: t.RemotePort,
+		SSHServer:  t.SSHServer,
+		SSHUser:    t.SSHUser,
+	}
+
+	data, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("failed to marshal last tunnel: %w", err)
+	}
+
+	return os.WriteFile(m.lastTunnelPath, data, 0644)
+}
+
+// LoadLastTunnel loads the last created tunnel configuration if it exists
+func (m *Manager) LoadLastTunnel() (*Tunnel, error) {
+	data, err := os.ReadFile(m.lastTunnelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // No last tunnel is not an error
+		}
+		return nil, fmt.Errorf("failed to read last tunnel: %w", err)
+	}
+
+	var t Tunnel
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal last tunnel: %w", err)
+	}
+
+	return &t, nil
 }
 
 // Create creates and starts a new SSH tunnel
@@ -117,7 +160,12 @@ func (m *Manager) Create(t *Tunnel) error {
 	t.PID = pid
 	m.tunnels[t.Name] = t
 
-	return m.save()
+	if err := m.save(); err != nil {
+		return err
+	}
+
+	// Save as last tunnel for future placeholders
+	return m.saveLastTunnel(t)
 }
 
 // List returns all configured tunnels
@@ -190,29 +238,113 @@ func (m *Manager) IsActive(name string) bool {
 
 	// Send signal 0 to check if process exists
 	err = process.Signal(os.Signal(nil))
-	return err == nil
+	if err != nil {
+		return false
+	}
+
+	// Double-check that the process is actually SSH
+	// This prevents false positives from PID reuse
+	if !isSSHProcess(t.PID) {
+		return false
+	}
+
+	// Verify the process is listening on the expected port
+	// This ensures it's our specific tunnel, not just any SSH process
+	return isProcessListeningOnPort(t.PID, t.LocalPort)
+}
+
+// isProcessListeningOnPort checks if a process is listening on a specific port
+func isProcessListeningOnPort(pid, port int) bool {
+	// Use lsof to check if this specific PID is listening on the port
+	cmd := exec.Command("lsof", "-ti", fmt.Sprintf("TCP:%d", port), "-sTCP:LISTEN", "-a", "-p", strconv.Itoa(pid))
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	pidStr := strings.TrimSpace(string(output))
+	foundPID, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return false
+	}
+
+	return foundPID == pid
 }
 
 // findSSHProcess attempts to find the PID of an SSH process for a given local port
+// Uses retry logic with exponential backoff to handle race conditions
 func findSSHProcess(localPort int) (int, error) {
-	// Use lsof to find the process listening on the local port
-	cmd := exec.Command("lsof", "-ti", fmt.Sprintf("tcp:%d", localPort))
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("failed to find process on port %d: %w", localPort, err)
+	maxRetries := 10
+	initialDelay := 50 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 50ms, 100ms, 200ms, 400ms, etc.
+			delay := initialDelay * time.Duration(1<<uint(attempt-1))
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+			time.Sleep(delay)
+		}
+
+		pid, err := findSSHProcessOnce(localPort)
+		if err == nil {
+			return pid, nil
+		}
+
+		// If it's not a "not found" error, return immediately
+		if !strings.Contains(err.Error(), "no process found") &&
+		   !strings.Contains(err.Error(), "exit status 1") {
+			return 0, err
+		}
 	}
 
-	pidStr := string(output)
+	return 0, fmt.Errorf("failed to find SSH process on port %d after %d attempts", localPort, maxRetries)
+}
+
+// findSSHProcessOnce makes a single attempt to find the SSH process
+func findSSHProcessOnce(localPort int) (int, error) {
+	// Use lsof with -iTCP to catch both IPv4 and IPv6
+	// -t: terse output (PIDs only)
+	// -iTCP:PORT: look for TCP connections on this port
+	// -sTCP:LISTEN: only show listening sockets
+	cmd := exec.Command("lsof", "-ti", fmt.Sprintf("TCP:%d", localPort), "-sTCP:LISTEN")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("no process found on port %d: %w", localPort, err)
+	}
+
+	pidStr := strings.TrimSpace(string(output))
 	if len(pidStr) == 0 {
 		return 0, fmt.Errorf("no process found on port %d", localPort)
 	}
 
-	// Parse the first PID (trim whitespace and newlines)
-	pidStr = pidStr[:len(pidStr)-1]
-	pid, err := strconv.Atoi(pidStr)
+	// If multiple PIDs, take the first line (most likely the SSH process)
+	lines := strings.Split(pidStr, "\n")
+	firstPID := strings.TrimSpace(lines[0])
+
+	pid, err := strconv.Atoi(firstPID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse PID: %w", err)
+		return 0, fmt.Errorf("failed to parse PID '%s': %w", firstPID, err)
+	}
+
+	// Verify it's actually an SSH process
+	if !isSSHProcess(pid) {
+		return 0, fmt.Errorf("process %d on port %d is not an SSH process", pid, localPort)
 	}
 
 	return pid, nil
+}
+
+// isSSHProcess checks if a given PID is an SSH process
+func isSSHProcess(pid int) bool {
+	// Use ps to get the command name
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	cmdName := strings.TrimSpace(string(output))
+	return cmdName == "ssh"
 }

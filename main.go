@@ -61,12 +61,33 @@ func createTunnel(manager *tunnel.Manager) {
 		sshUser    string
 	)
 
+	// Load last tunnel for placeholders
+	lastTunnel, err := manager.LoadLastTunnel()
+	var (
+		namePlaceholder       = ""
+		localPortPlaceholder  = "8080"
+		remoteHostPlaceholder = "localhost"
+		remotePortPlaceholder = "80"
+		sshServerPlaceholder  = "ssh.example.com:22"
+		sshUserPlaceholder    = "user"
+	)
+
+	if err == nil && lastTunnel != nil {
+		namePlaceholder = lastTunnel.Name
+		localPortPlaceholder = strconv.Itoa(lastTunnel.LocalPort)
+		remoteHostPlaceholder = lastTunnel.RemoteHost
+		remotePortPlaceholder = strconv.Itoa(lastTunnel.RemotePort)
+		sshServerPlaceholder = lastTunnel.SSHServer
+		sshUserPlaceholder = lastTunnel.SSHUser
+	}
+
 	form := huh.NewForm(
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Tunnel Name").
 				Description("A friendly name for this tunnel").
 				Value(&name).
+				Placeholder(namePlaceholder).
 				Validate(func(s string) error {
 					if s == "" {
 						return fmt.Errorf("name cannot be empty")
@@ -77,7 +98,7 @@ func createTunnel(manager *tunnel.Manager) {
 				Title("Local Port").
 				Description("Port on your local machine").
 				Value(&localPort).
-				Placeholder("8080").
+				Placeholder(localPortPlaceholder).
 				Validate(func(s string) error {
 					if _, err := strconv.Atoi(s); err != nil {
 						return fmt.Errorf("must be a valid port number")
@@ -88,7 +109,7 @@ func createTunnel(manager *tunnel.Manager) {
 				Title("Remote Host").
 				Description("Destination host (e.g., localhost, 192.168.1.1)").
 				Value(&remoteHost).
-				Placeholder("localhost").
+				Placeholder(remoteHostPlaceholder).
 				Validate(func(s string) error {
 					if s == "" {
 						return fmt.Errorf("remote host cannot be empty")
@@ -99,7 +120,7 @@ func createTunnel(manager *tunnel.Manager) {
 				Title("Remote Port").
 				Description("Port on the remote host").
 				Value(&remotePort).
-				Placeholder("80").
+				Placeholder(remotePortPlaceholder).
 				Validate(func(s string) error {
 					if _, err := strconv.Atoi(s); err != nil {
 						return fmt.Errorf("must be a valid port number")
@@ -112,7 +133,7 @@ func createTunnel(manager *tunnel.Manager) {
 				Title("SSH Server").
 				Description("SSH server to tunnel through").
 				Value(&sshServer).
-				Placeholder("ssh.example.com:22").
+				Placeholder(sshServerPlaceholder).
 				Validate(func(s string) error {
 					if s == "" {
 						return fmt.Errorf("SSH server cannot be empty")
@@ -123,7 +144,7 @@ func createTunnel(manager *tunnel.Manager) {
 				Title("SSH User").
 				Description("Username for SSH connection").
 				Value(&sshUser).
-				Placeholder("user").
+				Placeholder(sshUserPlaceholder).
 				Validate(func(s string) error {
 					if s == "" {
 						return fmt.Errorf("SSH user cannot be empty")
@@ -133,8 +154,7 @@ func createTunnel(manager *tunnel.Manager) {
 		),
 	)
 
-	err := form.Run()
-	if err != nil {
+	if err := form.Run(); err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
