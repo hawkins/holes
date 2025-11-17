@@ -11,7 +11,17 @@ A command-line interface for managing SSH tunnels, built with the [Huh](https://
 
 ## Installation
 
+Install directly from GitHub:
+
 ```bash
+go install github.com/hawkins/holes@latest
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/hawkins/holes.git
+cd holes
 go build -o holes
 ```
 
@@ -20,8 +30,10 @@ go build -o holes
 Run the application:
 
 ```bash
-./holes
+holes
 ```
+
+(If you built from source, use `./holes` instead)
 
 The interactive menu will guide you through:
 
